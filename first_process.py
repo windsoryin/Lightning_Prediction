@@ -1,6 +1,6 @@
 import os
 import pandas as pd
-path = r'.\10km'
+path = r'.\30km'
 # 处理数据部分：将 2018/01/01 00:00:00 格式的date分为5列
 for file in os.listdir(path):
     if file.endswith('.csv'):

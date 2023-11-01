@@ -15,8 +15,8 @@ from flaml import AutoML
 from flaml import tune
 import matplotlib.pyplot as plt
 import argparse
-
-from custom_model import custom_model
+from xgboost import plot_importance
+from custom_model import custom_model,MyEasyEnsemble
 
 def Find_Optimal_Cutoff(TPR, FPR, threshold):
     """
@@ -73,7 +73,11 @@ def Score(y, y_pred, index,title):
         n = n + 1
     POD = 0 if (TP + FN)==0 else round((TP / (TP + FN)) * 100.0, 2)
     FAR = 0 if (FP + TP)==0 else round((FP / (FP + TP)) * 100.0, 2)
-    return FN, FP, TN, TP, POD, FAR
+    TS = TP/(TP+FN+FP)
+    HSS=2*(TP*TN-FP*FN)/((TP+FN)*(FN+TN)+(TP+FP)*(FP+TN))
+
+
+    return FN, FP, TN, TP, POD, FAR, TS, HSS
 
     # print(f'Fold:{j} on train_data:FN={FN},FP={FP},TP={TP},TN={TN}')
     # print("POD: %.2f%%" % ((TP / (TP + FN)) * 100.0))
@@ -93,6 +97,7 @@ def Data1_Lightning_Prediction_Model_1(args,hyperparameters, data1_csv_path, lig
 
     X_data = data.drop(['flash'], axis=1)
     y_data = data['flash']
+
     model = custom_model(args)
     model.fit(X_data, y_data)
 
@@ -101,20 +106,23 @@ def Data1_Lightning_Prediction_Model_1(args,hyperparameters, data1_csv_path, lig
     plot_AUC(model, X_data, y_data)
     fpr, tpr, threshold = metrics.roc_curve(y_data, preds)  # 计算真正率和假正率
     optimal_threshold, point = Find_Optimal_Cutoff(tpr, fpr, threshold)  # 使用约登指数计算最佳阈值
-    optimal_threshold = optimal_threshold+0.4
+    # optimal_threshold = optimal_threshold+0.1
     preds[preds >= optimal_threshold] = 1
     preds[preds < optimal_threshold] = 0
     y_train_pred = preds
 
     train_index=y_data.index.values
     # 计算训练集上评分
-    FN, FP, TN, TP, POD, FAR = Score(y_data, y_train_pred, train_index, 'train results')
+    FN, FP, TN, TP, POD, FAR, TS, HSS = Score(y_data, y_train_pred, train_index, 'train results')
 
     # sava the model
     model.save_model(lightning_model_on_data_1_path)
     np.save('thresh.npy', optimal_threshold)
 
+    #
+    # f,s=model.feature_importance()
 
+    print('step 1 finish')
     # # k-fold CV using POD and FAR as eval metric
     # kf = KFold(n_splits=3, shuffle=False)
     #
@@ -211,7 +219,9 @@ def Detector_train_on_Data_1(lightning_model_path, data1_csv_path, add_select_on
     # Predictor 1 results on Data 1
     cm = confusion_matrix(y_true=y_data, y_pred=y_pred_data1)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
-    disp.plot()
+    ax_1=plt.figure().subplots()
+    ax_1.set(title='Original Predictor results')
+    disp.plot(ax=ax_1)
     plt.show(block=True)
     # 合并数组
     data = data.assign(pred_flash=y_pred_data1)
@@ -222,7 +232,7 @@ def Detector_train_on_Data_1(lightning_model_path, data1_csv_path, add_select_on
     # predict == true: 0
     # predict != true: 1  (anomaly value)
     df = pd.read_csv(add_select_on_data_1_to_csv_path)
-    df['select'] = df['flash'].eq(df['pred_flash']).map({True: 0, False: 1})
+    df['select'] = df['flash'].eq(df['pred_flash']).map({True: 1, False: 0})
     df.to_csv(add_select_on_data_1_to_csv_path, index=False)
 
     # Detector train on Data 1
@@ -272,7 +282,9 @@ def Detector_train_on_Data_1(lightning_model_path, data1_csv_path, add_select_on
 
     cm = confusion_matrix(y_true=y_target, y_pred=preds)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
-    disp.plot()
+    ax_1=plt.figure().subplots()
+    ax_1.set(title='Detector results')
+    disp.plot(ax=ax_1)
     plt.show(block=True)
 
 
@@ -291,10 +303,10 @@ def Detector_train_on_Data_1(lightning_model_path, data1_csv_path, add_select_on
     print(sum(y_pred_slect))
 
     # check results on Data 1 after removing detector
-    y_data=y_data[(y_pred_slect==0)]
-    y_pred_data1=y_pred_data1[(y_pred_slect==0)]
+    y_data=y_data[(y_pred_slect==1)]
+    y_pred_data1=y_pred_data1[(y_pred_slect==1)]
     index=np.arange(len(y_data))
-    FN, FP, TN, TP, POD, FAR = Score(y_data, y_pred_data1, index, 'result after Detector')
+    FN, FP, TN, TP, POD, FAR, TS, HSS = Score(y_data, y_pred_data1, index, 'Predictor result after Detector')
 
     # Save detector model
     joblib.dump(filename=detector_on_data_1_model_path, value=model)
@@ -325,189 +337,274 @@ def Detector_evaluate_on_Data_2(detector_on_data_1_model_path, data2_csv_path):
     df.to_csv(data2_csv_path, index=False)
 
 # Data2: Lightning Prediction Model 2
-def Lightning_Prediction_Model_2(data2_csv_path, lightning_model_on_data_1_path):
+def Lightning_Prediction_Model_2(data2_csv_path,station_list, station_order, n_split,lightning_model_on_data_1_path):
     optimal_threshold=np.load('thresh.npy')
 
-    data = pd.read_csv(data2_csv_path)
-    model = joblib.load(filename=lightning_model_on_data_1_path)
-    X_data = data.iloc[:,:-2]
-    y_data = data['flash']
+    for itr,station_name in enumerate(station_list):
+        print(f'processing {station_name} data')
+        data = pd.read_csv(data2_csv_path)
+        #######
+        # select only one station per time
+        data=data.drop(station_order[station_order!=itr].index)
+        data.reset_index(inplace=True, drop=True)
+        ##
+        model = joblib.load(filename=lightning_model_on_data_1_path)
+        X_data = data.iloc[:,:-2]
+        y_data = data['flash']
 
-    y_pred_data1 = model.predict_proba(X_data)
-    y_pred_data1 = (y_pred_data1[:, 1] >= optimal_threshold).astype(int)  # 提取出预测为闪电的概率
+        y_pred_data1 = model.predict_proba(X_data)
+        y_pred_data1 = (y_pred_data1[:, 1] >= optimal_threshold).astype(int)  # 提取出预测为闪电的概率
 
-    select_data=data['select']
-    print(sum(select_data))
-    # Predictor 1 results on Data 1
-    cm = confusion_matrix(y_true=y_data, y_pred=y_pred_data1)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
-    disp.plot()
-    plt.show(block=True)
-    # After Detector remove anomalies
-    cm = confusion_matrix(y_true=y_data[select_data==0], y_pred=y_pred_data1[select_data==0])
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
-    disp.plot()
-    plt.show(block=True)
+        select_data=data['select']
+        print(sum(select_data))
+        print(len(select_data))
+        # Predictor 1 results on Data 1
+        cm = confusion_matrix(y_true=y_data, y_pred=y_pred_data1)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
+        disp.plot()
+        plt.show(block=True)
+        # After Detector remove anomalies
+        cm = confusion_matrix(y_true=y_data[select_data==1], y_pred=y_pred_data1[select_data==1])
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['1', '2'])
+        disp.plot()
+        plt.show(block=True)
 
-    best_model=model.model.estimator
+        best_model=model.model.estimator
+        # plot_importance(best_model,importance_type='gain')
+        # plt.show(block=True)
+        # plt.barh(best_model.feature_name_, best_model.feature_importances_)
+        # plt.show(block=True)
 
-    ################################
-    # k-fold
-    train_PODs = []
-    train_FARs = []
-    test_PODs = []
-    test_FARs = []
-    kf = KFold(n_splits=2, shuffle=False)
-    j = 1
-    for train_index, test_index in kf.split(data):
+        importances_list = []
+        for sampler in best_model.estimators_:
+            importances = sampler.steps[-1][1].feature_importances_
+            importances_list.append(importances)
 
-        # 将数据集划分为训练集和测试集
-        train_data = data.iloc[train_index]
-        test_data = data.iloc[test_index]
+        mean_importances = np.mean(importances_list, axis=0)
+        # 假设importances是特征重要性的结果
+        features = range(len(mean_importances))
+        plt.bar(features, mean_importances)
+        plt.xticks(features)
+        plt.xlabel("Feature")
+        plt.ylabel("Importance")
+        plt.show()
 
-        X_train, X_test = data.iloc[train_index].drop(['flash'], axis=1), data.iloc[test_index].drop(['flash'], axis=1)
-        y_train, y_test = data.iloc[train_index]['flash'], data.iloc[test_index]['flash']
-        X_train = X_train.drop(columns=['select'])
-        X_test = X_test.drop(columns=['select'])
+        ################################
+        # k-fold
+        train_PODs = []
+        train_FARs = []
+        test_PODs = []
+        test_FARs = []
+        test_TSs=[]
+        test_HSSs=[]
+        before_PODs=[]
+        before_FARs=[]
+        before_TSs=[]
+        before_HSSs=[]
 
-        best_model.fit(X_train,y_train)
-        probs = best_model.predict_proba(X_train)  # 得到含有每个样本的概率矩阵
-        preds = probs[:, 1]  # 提取出预测为闪电的概率
-        plot_AUC(best_model, X_train, y_train)
-        fpr, tpr, threshold = metrics.roc_curve(y_train, preds)  # 计算真正率和假正率
-        optimal_threshold, point = Find_Optimal_Cutoff(tpr, fpr, threshold)  # 使用约登指数计算最佳阈值
-        optimal_threshold = optimal_threshold+0.1
-        preds[preds >= optimal_threshold] = 1
-        preds[preds < optimal_threshold] = 0
-        y_train_pred = preds
+        kf = KFold(n_splits=n_split, shuffle=False)
+        j = 1
+        for train_index, test_index in kf.split(data):
+
+            # 将数据集划分为训练集和测试集
+            train_data = data.iloc[train_index]
+            test_data = data.iloc[test_index]
+
+            X_train, X_test = data.iloc[train_index].drop(['flash'], axis=1), data.iloc[test_index].drop(['flash'], axis=1)
+            y_train, y_test = data.iloc[train_index]['flash'], data.iloc[test_index]['flash']
+            X_train = X_train.drop(columns=['select'])
+            X_test = X_test.drop(columns=['select'])
+
+            best_model.fit(X_train,y_train)
+            probs = best_model.predict_proba(X_train)  # 得到含有每个样本的概率矩阵
+            preds = probs[:, 1]  # 提取出预测为闪电的概率
+            plot_AUC(best_model, X_train, y_train)
+            fpr, tpr, threshold = metrics.roc_curve(y_train, preds)  # 计算真正率和假正率
+            optimal_threshold, point = Find_Optimal_Cutoff(tpr, fpr, threshold)  # 使用约登指数计算最佳阈值
+            optimal_threshold = optimal_threshold+0.01
+            preds[preds >= optimal_threshold] = 1
+            preds[preds < optimal_threshold] = 0
+            y_train_pred = preds
 
 
-        select_train, select_test = data.iloc[train_index]['select'], data.iloc[test_index]['select']
+            select_train, select_test = data.iloc[train_index]['select'], data.iloc[test_index]['select']
 
-        # 计算训练集上评分
-        y_train=y_train[(select_train==0)]
-        y_train_pred=y_train_pred[(select_train==0)]
-        train_index=train_index[(select_train==0)]
-        FN, FP, TN, TP, POD, FAR = Score(y_train, y_train_pred, train_index,'train reusults')
-        print(f'Fold:{j} on train_data_2:FN={FN},FP={FP},TP={TP},TN={TN}')
-        print("POD: %.2f%%" % ((TP / (TP + FN)) * 100.0))
-        print("FAR: %.2f%%" % ((FP / (FP + TP)) * 100.0))
-        train_PODs.append(POD)
-        train_FARs.append(FAR)
+            # 计算训练集上评分
+            y_train=y_train[(select_train==1)]
+            y_train_pred=y_train_pred[(select_train==1)]
+            train_index=train_index[(select_train==1)]
+            FN, FP, TN, TP, POD, FAR, TS, HSS = Score(y_train, y_train_pred, train_index,'train reusults')
+            print(f'Fold:{j} on train_data_2:FN={FN},FP={FP},TP={TP},TN={TN}')
+            print("POD: %.2f%%" % ((TP / (TP + FN)) * 100.0))
+            print("FAR: %.2f%%" % ((FP / (FP + TP)) * 100.0))
+            train_PODs.append(POD)
+            train_FARs.append(FAR)
 
-        probs = best_model.predict_proba(X_test)
-        preds = probs[:, 1]  # 提取出预测为闪电的概率
-        plot_AUC(best_model, X_test, y_test)
-        preds[preds >= optimal_threshold] = 1
-        preds[preds < optimal_threshold] = 0
-        y_test_pred = preds
+            probs = best_model.predict_proba(X_test)
+            preds = probs[:, 1]  # 提取出预测为闪电的概率
+            plot_AUC(best_model, X_test, y_test)
+            preds[preds >= optimal_threshold] = 1
+            preds[preds < optimal_threshold] = 0
+            y_test_pred = preds
 
-        # # 计算测试集上评分
-        y_test=y_test[(select_test==0)]
-        y_test_pred=y_test_pred[(select_test==0)]
-        test_index=test_index[(select_test==0)]
-        FN, FP, TN, TP, POD, FAR = Score(y_test, y_test_pred, test_index,'test results ')
-        test_PODs.append(POD)
-        test_FARs.append(FAR)
-        print(f'Fold:{j} on test_data_2:FN={FN},FP={FP},TP={TP},TN={TN}')
-        print("POD: %.2f%%" % POD)
-        print("FAR: %.2f%%" % FAR)
-        j = j + 1
+            # # 计算测试集上评分
+            FN, FP, TN, TP, POD, FAR, TS, HSS = Score(y_test, y_test_pred, test_index,'test results ')
+            before_PODs.append(POD)
+            before_FARs.append(FAR)
+            before_TSs.append(TS)
+            before_HSSs.append(HSS)
 
-    test_FAR_avg = sum(test_FARs) / len(test_FARs)
-    print('average test far:', )
+            ### remove select
+            y_test=y_test[(select_test==1)]
+            y_test_pred=y_test_pred[(select_test==1)]
+            test_index=test_index[(select_test==1)]
+            FN, FP, TN, TP, POD, FAR, TS, HSS = Score(y_test, y_test_pred, test_index,'test results ')
+            test_PODs.append(POD)
+            test_FARs.append(FAR)
+            test_TSs.append(TS)
+            test_HSSs.append(HSS)
+            print(f'Fold:{j} on test_data_2:FN={FN},FP={FP},TP={TP},TN={TN}')
+            print("POD: %.2f%%" % POD)
+            print("FAR: %.2f%%" % FAR)
+            j = j + 1
+
+        test_FAR_avg = sum(test_FARs) / len(test_FARs)
+        test_POD_avg = sum(test_PODs) / len(test_PODs)
+
+        print('average test FAR: %.2f%%' % test_FAR_avg)
+        print('average test POD: %.2f%%' % test_POD_avg)
+
+        # 打开文件
+
+        with open(f'./results/{station_name}.csv', 'w', newline='') as f:
+            # 创建csv写入器
+            writer = csv.writer(f, delimiter=',')
+            # 写入表头
+            writer.writerow(['POD', 'FAR', 'TS', 'HSS','before_POD', 'before_FAR', 'before_TS', 'before_HSS'])
+            # 写入数据
+            writer.writerows(zip(test_PODs, test_FARs, test_TSs,test_HSSs,before_PODs,before_FARs,before_TSs,before_HSSs))
+        # 关闭文件
+        f.close()
+
+
 
 # overall metric
 
 if __name__ == "__main__":
     # # ————————————————————————————————————————————————————————————————————————————————————————————————————
-    path = r'.\30km'
-    station_list=['lfs','sek','wlp'] # station list
+    path = r'./pwv_add/30km'
+    station_list_all=['sek','pen','hka','kp','sha'] #list of all stations
 
-    # dataset split into 1 and 2
-    data1 = pd.DataFrame()
-    data2 = pd.DataFrame()
+    for itr,station_single in enumerate(station_list_all):
+        station_list=[station_single]  # every time use one station
+        # dataset split into 1 and 2
+        data1 = pd.DataFrame()
+        data2 = pd.DataFrame()
+        station_i=0
+        for file in os.listdir(path):
+            if file.endswith('.csv'):
+                if any(station in file for station in station_list):
+                    df = pd.read_csv(os.path.join(path, file))
+                    df1 = df[(df['year'] >= 2018) & (df['year'] <= 2019)]
+                    df1.insert(df1.shape[1],'station',station_i)
+                    data1 = pd.concat([data1, df1], ignore_index=True)
+                    df2 = df[(df['year'] >= 2020) & (df['year'] <= 2022)]
+                    df2.insert(df2.shape[1],'station',station_i)
+                    data2 = pd.concat([data2, df2], ignore_index=True)
+                    station_i = station_i + 1
 
-    for file in os.listdir(path):
-        if file.endswith('.csv'):
-            if any(station in file for station in station_list):
-                df = pd.read_csv(os.path.join(path, file))
-                df1 = df[(df['year'] >= 2018) & (df['year'] <= 2020)]
-                data1 = pd.concat([data1, df1], ignore_index=True)
-                df2 = df[(df['year'] >= 2021) & (df['year'] <= 2022)]
-                data2 = pd.concat([data2, df2], ignore_index=True)
+        # Data 1 And Data2 , Cross Validation Split
+        n_split1=2
+        n_split2=3
 
-    data1 = data1.sort_values(by=['year', 'month', 'day', 'hour'])
-    select_columns=['year', 'month', 'day', 'hour', 'doy', 't2m', 'sp', 'rh', 'tp']
-    # data1[select_columns]=(data1[select_columns]-data1[select_columns].mean())/data1[select_columns].std()
-    data2 = data2.sort_values(by=['year', 'month', 'day', 'hour'])
-    # data2[select_columns]=(data2[select_columns]-data2[select_columns].mean())/data2[select_columns].std()
-
-
-    # delete rows and columns
-    delete_columns=['month','day']
-    data1=data1.drop(columns=delete_columns)
-    data2=data2.drop(columns=delete_columns)
-
-    # add past lightning as input
-    ######################################
-    data1.reset_index(inplace=True, drop=True)
-    data2.reset_index(inplace=True, drop=True)
-
-    past_flash1= data1.iloc[:-1,:]
-    past_flash2= data2.iloc[:-1,:]
-
-    data1=data1.drop(data1.index[[0]])
-    data2=data2.drop(data1.index[[0]])
-    data1.reset_index(inplace=True, drop=True)
-    data2.reset_index(inplace=True, drop=True)
-    #
-    data1['past_flash']=past_flash1['flash']
-    data2['past_flash'] = past_flash2['flash']
-    columns = list(data1)
-    # move the column to head of list using index, pop and insert
-    columns.insert(-1, columns.pop(columns.index('past_flash')))
-    # use loc to reorder
-    data1 = data1.loc[:, columns]
-    data2 = data2.loc[:, columns]
-    ######################################
-
-    data1.to_csv('./data/data1.csv', index=False)
-    data2.to_csv('./data/data2.csv', index=False)
-
-    # ————————————————————————————————————————————————————————————————————————————————————————————————————
-
-    data1_csv_path = './data/data1.csv'
-    data2_csv_path = './data/data2.csv'
-    lightning_model_on_data_1_path = './model/lightning_on_data_1.h5'
-    add_select_on_data_1_to_csv_path = './data/data1_add_select.csv'
-    detector_on_data_1_model_path = './model/detector_model_on_data_1.h5'
-    hyperparameters = [
-        {'n_estimators': 50, 'random_state': 42},
-    ]
-
-    #########################################
-    # parameter definition
-
-    parser = argparse.ArgumentParser(description='Lightning Prediction')
-
-    parser.add_argument('--model', type=str, required=False, default='flaml',
-                        help='model name')
-    # easy ensemble parameters
-    parser.add_argument('--n_estimators', type=int, required=False, default=40, help='n_estimators')
-    parser.add_argument('--random_state', type=int, required=False, default=24, help='random_state')
-
-    args = parser.parse_args()
-    #########################################
+        # data1 = data1.sort_values(by=['year', 'month', 'day', 'hour'])
+        # select_columns=['year', 'month', 'day', 'hour', 'doy', 't2m', 'sp', 'rh', 'tp']
+        # # data1[select_columns]=(data1[select_columns]-data1[select_columns].mean())/data1[select_columns].std()
+        # data2 = data2.sort_values(by=['year', 'month', 'day', 'hour'])
+        # # data2[select_columns]=(data2[select_columns]-data2[select_columns].mean())/data2[select_columns].std()
 
 
-    # step 1: train predictor 1 on data 1
-    # Data1_Lightning_Prediction_Model_1(args,hyperparameters, data1_csv_path, lightning_model_on_data_1_path)
-    # step 2: train Detector 1 on Data 1
-    # Detector_train_on_Data_1(lightning_model_on_data_1_path, data1_csv_path, add_select_on_data_1_to_csv_path, detector_on_data_1_model_path)
-    # Step 3: use Detector remove anomaly value on Data 2
-    Detector_evaluate_on_Data_2(detector_on_data_1_model_path, data2_csv_path)
-    # Predict on Data 2
-    Lightning_Prediction_Model_2(data2_csv_path, lightning_model_on_data_1_path)
+
+
+        # add past lightning as input
+        ######################################
+        data1.reset_index(inplace=True, drop=True)
+        data2.reset_index(inplace=True, drop=True)
+
+        past_flash1= data1.iloc[:-1,:]
+        past_flash2= data2.iloc[:-1,:]
+
+        data1=data1.drop(data1.index[[0]])
+        data2=data2.drop(data1.index[[0]])
+        data1.reset_index(inplace=True, drop=True)
+        data2.reset_index(inplace=True, drop=True)
+        #
+        data1['past_flash']=past_flash1['flash']
+        data2['past_flash'] = past_flash2['flash']
+        columns = list(data1)
+        # move the column to head of list using index, pop and insert
+        columns.insert(-2, columns.pop(columns.index('past_flash')))
+        # use loc to reorder
+        data1 = data1.loc[:, columns]
+        data2 = data2.loc[:, columns]
+        ######################################
+
+        # sort data by date
+        data1 = data1.sort_values(by=['year', 'month', 'day', 'hour'])
+        # select_columns=['year', 'month', 'day', 'hour', 'doy', 't2m', 'sp', 'rh', 'tp']
+        # # data1[select_columns]=(data1[select_columns]-data1[select_columns].mean())/data1[select_columns].std()
+        data2 = data2.sort_values(by=['year', 'month', 'day', 'hour'])
+
+        station_order1=data1['station']
+        station_order2=data2['station']
+
+        # delete rows and columns
+        delete_columns=['year','doy','station']
+        data1=data1.drop(columns=delete_columns)
+        data2=data2.drop(columns=delete_columns)
+        data1.reset_index(inplace=True, drop=True)
+        data2.reset_index(inplace=True, drop=True)
+
+        data1.to_csv('./data/data1.csv', index=False)
+        data2.to_csv('./data/data2.csv', index=False)
+
+        # ————————————————————————————————————————————————————————————————————————————————————————————————————
+
+        data1_csv_path = './data/data1.csv'
+        data2_csv_path = './data/data2.csv'
+        lightning_model_on_data_1_path = './model/lightning_on_data_1.h5'
+        add_select_on_data_1_to_csv_path = './data/data1_add_select.csv'
+        detector_on_data_1_model_path = './model/detector_model_on_data_1.h5'
+        hyperparameters = [
+            {'n_estimators': 50, 'random_state': 42},
+        ]
+
+        #########################################
+        # parameter definition
+
+        parser = argparse.ArgumentParser(description='Lightning Prediction')
+
+        parser.add_argument('--model', type=str, required=False, default='easy_ensemble',
+                            help='model name')
+        # easy ensemble parameters
+        parser.add_argument('--n_estimators', type=int, required=False, default=40, help='n_estimators')
+        parser.add_argument('--random_state', type=int, required=False, default=24, help='random_state')
+
+        # flaml parameters
+        parser.add_argument('--time_budget', type=int, required=False, default=40, help='time_budget')
+        parser.add_argument('--n_split', type=int, required=False, default=n_split1, help='n_split of Data 1')
+
+        args = parser.parse_args()
+        #########################################
+
+
+        # # # step 1: train predictor 1 on data 1
+        Data1_Lightning_Prediction_Model_1(args,hyperparameters, data1_csv_path, lightning_model_on_data_1_path)
+        # # # # step 2: train Detector 1 on Data 1
+        Detector_train_on_Data_1(lightning_model_on_data_1_path, data1_csv_path, add_select_on_data_1_to_csv_path, detector_on_data_1_model_path)
+        # # # Step 3: use Detector remove anomaly value on Data 2
+        Detector_evaluate_on_Data_2(detector_on_data_1_model_path, data2_csv_path)
+        # Predict on Data 2
+        Lightning_Prediction_Model_2(data2_csv_path,station_list, station_order2, n_split2, lightning_model_on_data_1_path)
 
 
